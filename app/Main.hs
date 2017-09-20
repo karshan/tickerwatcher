@@ -1,62 +1,72 @@
-{-# LANGUAGE RecordWildCards   #-}
-{-# LANGUAGE OverloadedStrings #-}
+{-# OPTIONS_GHC -fno-warn-type-defaults #-}
+{-# LANGUAGE OverloadedStrings          #-}
+{-# LANGUAGE ExtendedDefaultRules       #-}
+{-# LANGUAGE NoImplicitPrelude          #-}
+{-# LANGUAGE FlexibleContexts           #-}
 module Main where
 
 import Control.Concurrent
+import Control.Lens (zoom, _1)
 import Control.Monad
 
-import Data.Monoid ((<>))
 import Data.Time.Clock
-import qualified Data.Text as T
-import qualified Data.Text.Lazy as TL
-
-import System.Process
+import qualified Data.Map as Map
 
 import PriceAPI.CryptoWatch
 import Trigger
 
 import Google.SendMail
 
-minuteDelay :: Int -> IO ()
-minuteDelay n = threadDelay (n * 60 * 1000000)
+import Protolude
 
-head' :: [a] -> Maybe a
-head' []    = Nothing
-head' (x:_) = Just x
+zoomMaybe :: (Monad m) => StateT s m a -> StateT (Maybe s) m (Maybe a)
+zoomMaybe origAction = do
+    mS <- get
+    maybe
+        (return Nothing)
+        (\s -> do
+            (out, newS) <- lift (runStateT origAction s)
+            put (Just newS)
+            return (Just out))
+        mS
 
-readMaybe :: Read a => String -> Maybe a
-readMaybe = fmap fst . head' . reads
+minuteDelay :: MonadIO m => Int -> m ()
+minuteDelay n = liftIO $ threadDelay (n * 60 * 1000000)
 
-data Config =
-    Config {
-        btcC :: TriggerCond
-      , ltcC :: TriggerCond
-      , ethC :: TriggerCond
-    } deriving (Eq, Ord, Show, Read)
+type Config = Map Ticker TriggerCond
+
+-- log and send mail
+sm :: MonadIO m => Text -> m ()
+sm m = do
+    putStrLn $ "Sending " <> m
+    void $ liftIO $ sendMail "svc-acc-key.json" "karshan@karshan.me" "karshan.sharma@gmail.com" m (toS m)
 
 main :: IO ()
-main = forever $ do
-    print =<< getCurrentTime
+main = void $ flip runStateT (Nothing, "") $ forever $ do
+    time <- lift getCurrentTime
     prices <- getPrices
-    mConfig <- readMaybe <$> readFile "config"
-    maybe (putStrLn "bad config")
-        (evalConfig prices)
-        mConfig
-    minuteDelay 5
+    putStrLn $ (show time) ++ ": " ++ show prices
+    curConfigStr <- lift (readFile "config")
+    (_, lastConfigStr) <- get
+    when (curConfigStr /= lastConfigStr)
+        (do
+            putStrLn "Loading new config"
+            put (readMaybe . toS $ curConfigStr, curConfigStr))
+    zoom _1 (zoomMaybe $ (evalConfig prices >>= mapM_ sm))
+    minuteDelay 1 
 
-evalConfig :: Prices -> Config -> IO ()
-evalConfig Prices{..} Config{..} = do
-    void $ sequence $ zipWith3
-        (\cond mPrice name ->
-            maybe (return ())
-                (\price ->
-                    if evalCond cond price then do
-                        let msg = name <> " = " <> T.pack (show price) <> (if lt cond then " < " else " > ") <> T.pack (show (val cond))
-                        putStrLn $ T.unpack msg
-                        void $ sendMail "svc-acc-key.json" "karshan@karshan.me" "karshan.sharma@gmail.com" msg (TL.fromStrict msg)
+evalConfig :: MonadState Config m => Prices -> m [Text]
+evalConfig prices = do
+    config <- get
+    fmap catMaybes $ mapM 
+        (\(ticker, trigger) ->
+            maybe
+                (return $ Just $ (show ticker) <> " = Nothing")
+                (\price -> do
+                    if evalCond trigger price then do
+                        modify (Map.insert ticker (trigger { lt = not (lt trigger) }))
+                        return $ Just $ (show ticker) <> " = " <> show price <> (if lt trigger then " < " else " > ") <> show (val trigger)
                     else
-                        return ())
-                mPrice)
-        [btcC, ltcC, ethC]
-        [btcusd, ltcusd, ethusd]
-        ["btc", "ltc", "eth"]
+                        return Nothing)
+                (Map.lookup ticker prices))
+        (Map.toList config)

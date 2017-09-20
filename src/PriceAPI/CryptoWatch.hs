@@ -1,26 +1,30 @@
-{-# LANGUAGE DataKinds             #-}
-{-# LANGUAGE TypeOperators         #-}
-{-# LANGUAGE TypeFamilies          #-}
-{-# LANGUAGE DeriveGeneric         #-}
-{-# LANGUAGE DeriveAnyClass        #-}
-{-# LANGUAGE OverloadedStrings     #-}
+{-# OPTIONS_GHC -fno-warn-unused-top-binds #-}
+{-# LANGUAGE DataKinds                     #-}
+{-# LANGUAGE TypeOperators                 #-}
+{-# LANGUAGE TypeFamilies                  #-}
+{-# LANGUAGE DeriveGeneric                 #-}
+{-# LANGUAGE DeriveAnyClass                #-}
+{-# LANGUAGE OverloadedStrings             #-}
+{-# LANGUAGE NoImplicitPrelude             #-}
 module PriceAPI.CryptoWatch
     ( getPrices
-    , Prices(..)
+    , Prices
+    , Ticker
     ) where
 
-import Control.Monad.Except (ExceptT)
-
 import Data.Aeson
+import qualified Data.Map as Map
 import Data.Proxy (Proxy(..))
 
 import GHC.Generics (Generic)
 
-import Network.HTTP.Client (newManager, Manager)
+import Network.HTTP.Client (newManager)
 import Network.HTTP.Client.TLS (tlsManagerSettings)
 
 import Servant.API
 import Servant.Client
+
+import Protolude
 
 type GdaxApi = "markets" :> "gdax" :>
     (    "btcusd" :> "price" :> Get '[JSON] Price
@@ -44,26 +48,27 @@ data GdaxAllowance =
       , remaining :: Int
     } deriving (Eq, Ord, Show, Generic, FromJSON)
 
-btcC :: ClientM Price
-ltcC :: ClientM Price
-ethC :: ClientM Price
-btcC :<|> ltcC :<|> ethC = client (Proxy :: Proxy GdaxApi)
+btcClient :: ClientM Price
+ltcClient :: ClientM Price
+ethClient :: ClientM Price
+btcClient :<|> ltcClient :<|> ethClient = client (Proxy :: Proxy GdaxApi)
 
-data Prices =
-    Prices {
-        btcusd :: Maybe Double
-      , ltcusd :: Maybe Double
-      , ethusd :: Maybe Double
-    } deriving (Eq, Ord, Show)
+type Prices = Map Ticker Double
+
+data Ticker = BTC | LTC | ETH deriving (Eq, Ord, Show, Read)
 
 eitherToMaybe :: Either e a -> Maybe a
 eitherToMaybe (Left _)  = Nothing
 eitherToMaybe (Right a) = Just a
 
-getPrices :: IO Prices
-getPrices = do
-    mgr     <- newManager tlsManagerSettings
-    results <- mapM (\x -> runClientM x (ClientEnv mgr (BaseUrl Https "api.cryptowat.ch" 443 ""))) [btcC, ltcC, ethC]
-    return $
-        (\x -> Prices (head x) (x !! 1) (x !! 2)) $
-            map (eitherToMaybe . fmap (price . result)) results
+getPrices :: MonadIO m => m Prices
+getPrices = liftIO $ do
+    mgr <- newManager tlsManagerSettings
+    foldM
+        (\acc (ticker, client_) -> do
+            r <- runClientM client_ (ClientEnv mgr (BaseUrl Https "api.cryptowat.ch" 443 ""))
+            return $ maybe acc
+                (\p -> Map.insert ticker p acc)
+                (eitherToMaybe . fmap (price . result) $ r))
+        Map.empty
+        [ (BTC, btcClient), (LTC, ltcClient), (ETH, ethClient) ]
