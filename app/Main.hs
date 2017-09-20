@@ -1,4 +1,5 @@
 {-# OPTIONS_GHC -fno-warn-type-defaults #-}
+{-# LANGUAGE ScopedTypeVariables        #-}
 {-# LANGUAGE OverloadedStrings          #-}
 {-# LANGUAGE ExtendedDefaultRules       #-}
 {-# LANGUAGE NoImplicitPrelude          #-}
@@ -33,10 +34,11 @@ zoomMaybe origAction = do
 minuteDelay :: MonadIO m => Int -> m ()
 minuteDelay n = liftIO $ threadDelay (n * 60 * 1000000)
 
-type Config = Map Ticker TriggerCond
+type Config = Map Ticker [TriggerCond]
+type Notification = Text
 
 -- log and send mail
-sm :: MonadIO m => Text -> m ()
+sm :: MonadIO m => Notification -> m ()
 sm m = do
     putStrLn $ "Sending " <> m
     void $ liftIO $ sendMail "svc-acc-key.json" "karshan@karshan.me" "karshan.sharma@gmail.com" m (toS m)
@@ -53,20 +55,27 @@ main = void $ flip runStateT (Nothing, "") $ forever $ do
             putStrLn "Loading new config"
             put (readMaybe . toS $ curConfigStr, curConfigStr))
     zoom _1 (zoomMaybe $ (evalConfig prices >>= mapM_ sm))
-    minuteDelay 1 
+    minuteDelay 1
 
-evalConfig :: MonadState Config m => Prices -> m [Text]
+evalConfig :: MonadState Config m => Prices -> m [Notification]
 evalConfig prices = do
-    config <- get
-    fmap catMaybes $ mapM 
-        (\(ticker, trigger) ->
+    config :: Config <- get
+    fmap concat $ mapM
+        (\(ticker, triggers) ->
             maybe
-                (return $ Just $ (show ticker) <> " = Nothing")
+                (return $ [(show ticker) <> " = Nothing"])
                 (\price -> do
-                    if evalCond trigger price then do
-                        modify (Map.insert ticker (trigger { lt = not (lt trigger) }))
-                        return $ Just $ (show ticker) <> " = " <> show price <> (if lt trigger then " < " else " > ") <> show (val trigger)
-                    else
-                        return Nothing)
+                    let (newTriggers, notifications) = foldl
+                            (\(accTriggers, accNotifications) trigger ->
+                                if evalCond trigger price then
+                                    let notification = (show ticker) <> " = " <> show price <> (if lt trigger then " < " else " > ") <> show (val trigger)
+                                        invertedTrigger = trigger { lt = not (lt trigger) }
+                                    in (invertedTrigger:accTriggers, notification:accNotifications)
+                                else
+                                    (trigger:accTriggers, accNotifications))
+                            ([], [])
+                            triggers
+                    modify (Map.insert ticker newTriggers)
+                    return notifications)
                 (Map.lookup ticker prices))
         (Map.toList config)
