@@ -9,7 +9,7 @@
 module PriceAPI.CryptoWatch
     ( getPrices
     , Prices
-    , Ticker
+    , Ticker (..)
     ) where
 
 import Data.Aeson

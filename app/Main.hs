@@ -7,7 +7,7 @@
 module Main where
 
 import Control.Concurrent
-import Control.Lens (zoom, _1)
+--import Control.Lens (zoom, _1)
 import Control.Monad
 
 import Data.Time.Clock
@@ -43,39 +43,55 @@ sm m = do
     putStrLn $ "Sending " <> m
     void $ liftIO $ sendMail "svc-acc-key.json" "karshan@karshan.me" "karshan.sharma@gmail.com" m (toS m)
 
+pTriggers :: Double -> Double -> [TriggerCond]
+pTriggers percent curPrice =
+    [ TriggerCond True  ((1 - (percent/100)) * curPrice)
+    , TriggerCond False ((1 + (percent/100)) * curPrice)
+    ]
+
 main :: IO ()
-main = void $ flip runStateT (Nothing, "") $ forever $ do
-    time <- lift getCurrentTime
-    prices <- getPrices
-    putStrLn $ (show time) ++ ": " ++ show prices
-    curConfigStr <- lift (readFile "config")
-    (_, lastConfigStr) <- get
-    when (curConfigStr /= lastConfigStr)
-        (do
-            putStrLn "Loading new config"
-            put (readMaybe . toS $ curConfigStr, curConfigStr))
-    zoom _1 (zoomMaybe $ (evalConfig prices >>= mapM_ sm))
-    minuteDelay 1
+main = do
+    initialPrices <- getPrices
+    let mConfig :: Maybe Config = (do
+            curBtc <- Map.lookup BTC initialPrices
+            curLtc <- Map.lookup LTC initialPrices
+            curEth <- Map.lookup ETH initialPrices
+            return $ Map.fromList [
+                      (BTC, pTriggers 5 curBtc)
+                    , (LTC, pTriggers 5 curLtc)
+                    , (ETH, pTriggers 5 curEth)
+                    ])
+    print mConfig
+    maybe
+        (putStrLn "getPrices failed initially, manually retry please")
+        (\initConfig -> void $ flip runStateT initConfig $ forever $ do
+            minuteDelay 1
+            time <- lift getCurrentTime
+            prices <- getPrices
+            print =<< get
+            putStrLn $ (show time) ++ ": " ++ show prices
+            evalConfig prices >>= mapM_ sm)
+        mConfig
 
 evalConfig :: MonadState Config m => Prices -> m [Notification]
 evalConfig prices = do
-    config :: Config <- get
+    config <- get
     fmap concat $ mapM
         (\(ticker, triggers) ->
             maybe
                 (return $ [(show ticker) <> " = Nothing"])
                 (\price -> do
-                    let (newTriggers, notifications) = foldl
-                            (\(accTriggers, accNotifications) trigger ->
+                    let (didTrigger, notifications) = foldl
+                            (\(accDidTrigger, accNotifications) trigger ->
                                 if evalCond trigger price then
-                                    let notification = (show ticker) <> " = " <> show price <> (if lt trigger then " < " else " > ") <> show (val trigger)
-                                        invertedTrigger = trigger { lt = not (lt trigger) }
-                                    in (invertedTrigger:accTriggers, notification:accNotifications)
+                                    let notification = (show ticker) <> " = " <> show price <>
+                                            (if lt trigger then " < " else " > ") <> show (val trigger)
+                                    in (True, notification:accNotifications)
                                 else
-                                    (trigger:accTriggers, accNotifications))
-                            ([], [])
+                                    (accDidTrigger, accNotifications))
+                            (False, [])
                             triggers
-                    modify (Map.insert ticker newTriggers)
+                    when didTrigger (modify $ Map.insert ticker (pTriggers 5 price))
                     return notifications)
                 (Map.lookup ticker prices))
         (Map.toList config)
